@@ -49,6 +49,28 @@ if (isset($_GET['code'])) {
         $_SESSION['access_token']  = $tokenData['access_token'];
         $_SESSION['refresh_token'] = $tokenData['refresh_token'] ?? '';
         $_SESSION['token_expiry']  = time() + ($tokenData['expires_in'] ?? 1800);
+
+        // Verify the user has Admin role by calling an admin-only endpoint
+        $checkUrl = $orhrmBaseUrl . '/api/v2/admin/users?limit=1';
+        $chk = curl_init($checkUrl);
+        curl_setopt_array($chk, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => [
+                'Authorization: Bearer ' . $tokenData['access_token'],
+                'Accept: application/json',
+            ],
+            CURLOPT_TIMEOUT => 15,
+        ]);
+        $chkResponse = curl_exec($chk);
+        $chkHttpCode = curl_getinfo($chk, CURLINFO_HTTP_CODE);
+        curl_close($chk);
+
+        if ($chkHttpCode === 403 || $chkHttpCode === 401) {
+            // Not an admin — clear session and redirect with error
+            session_destroy();
+            header('Location: ' . $redirectUri . '?error=not_authorized');
+            exit;
+        }
     }
 
     // Redirect to remove code from URL, preserve report params
@@ -94,7 +116,8 @@ if (isset($_SESSION['access_token'], $_SESSION['token_expiry']) && time() >= $_S
 // Step 3: Handle logout
 if (isset($_GET['logout'])) {
     session_destroy();
-    header('Location: ' . $redirectUri);
+    // Redirect to OrangeHRM logout to fully destroy the OrangeHRM session too
+    header('Location: ' . $orhrmBaseUrl . '/auth/logout');
     exit;
 }
 
@@ -528,6 +551,12 @@ $loginUrl = $orhrmWebUrl . '/oauth2/authorize?'
             <!-- ───────── Login Screen ───────── -->
             <h1>Employee Attendance Report <span class="badge-api">via API</span></h1>
             <p class="subtitle">Uses OrangeHRM Daily 9Hr Compliance API with OAuth2 authentication</p>
+
+            <?php if (isset($_GET['error']) && $_GET['error'] === 'not_authorized'): ?>
+                <div class="error-box" style="margin-bottom:20px; text-align:center;">
+                    <strong>Access Denied:</strong> You are not authorised to login to SOHRM. Only users with the <strong>Admin</strong> role can access this application.
+                </div>
+            <?php endif; ?>
 
             <div class="auth-box">
                 <p>You need to sign in with your <strong>OrangeHRM Admin</strong> account to access this report.</p>
