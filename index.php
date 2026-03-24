@@ -7,53 +7,184 @@
  *   - /api/v2/attendance/employees/daily-hours-compliance
  *   - /api/v2/pim/employees
  *
- * Only Admin users can access (enforced by OrangeHRM API permissions).
+ * Standalone login — authenticates against OrangeHRM entirely via server-side cURL.
+ * Only Admin users can access.
  */
 
 session_start();
 
 // ───────────────────────────── Config ─────────────────────────────
-$orhrmBaseUrl = 'http://localhost/orangehrm/orangehrm/web/index.php';
-$orhrmWebUrl  = 'http://localhost/orangehrm/orangehrm/web';
-$clientId     = 'e02728981b5553a28649f8ff3d98431b';         // Register via Admin > OAuth Clients
-$clientSecret = 'i79D+RiOfsErbvDETYKpJ/zW1FIwPauXeJEZEqZNwkw=';
-$redirectUri  = 'http://localhost/SOHRM/index.php';
+require_once __DIR__ . '/config.php';
 
-// ───────────────────────────── OAuth2 Flow ────────────────────────
+$orhrmBaseUrl = OHRM_BASE_URL;
+$orhrmWebUrl  = OHRM_WEB_URL;
+$clientId     = OAUTH_CLIENT_ID;
+$clientSecret = OAUTH_CLIENT_SECRET;
+$redirectUri  = OAUTH_REDIRECT_URI;
 
-// Step 1: Handle callback with authorization code
-if (isset($_GET['code'])) {
-    $tokenUrl = $orhrmWebUrl . '/oauth2/token';
-    $postData = [
-        'grant_type'    => 'authorization_code',
-        'code'          => $_GET['code'],
-        'client_id'     => $clientId,
-        'client_secret' => $clientSecret,
-        'redirect_uri'  => $redirectUri,
-    ];
+$loginError = '';
 
-    $ch = curl_init($tokenUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => http_build_query($postData),
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
-        CURLOPT_TIMEOUT        => 15,
-    ]);
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
+// ───────────────────────────── Server-side OAuth2 Login ───────────
 
-    if ($httpCode === 200) {
-        $tokenData = json_decode($response, true);
-        $_SESSION['access_token']  = $tokenData['access_token'];
-        $_SESSION['refresh_token'] = $tokenData['refresh_token'] ?? '';
-        $_SESSION['token_expiry']  = time() + ($tokenData['expires_in'] ?? 1800);
+/**
+ * Perform the full OrangeHRM OAuth2 flow server-side via cURL:
+ *   1. GET  /auth/login           → extract CSRF token + session cookie
+ *   2. POST /auth/validate        → authenticate
+ *   3. GET  /oauth2/authorize     → initiate authorization
+ *   4. GET  /oauth2/authorize/consent?authorized=true → approve
+ *   5. POST /oauth2/token         → exchange code for access token
+ */
+function serverSideOAuth2Login(string $username, string $password, string $baseUrl, string $webUrl, string $clientId, string $clientSecret, string $redirectUri): array
+{
+    $cookieFile = tempnam(sys_get_temp_dir(), 'sohrm_');
 
-        // Verify the user has Admin role by calling an admin-only endpoint
-        $checkUrl = $orhrmBaseUrl . '/api/v2/admin/users?limit=1';
-        $chk = curl_init($checkUrl);
-        curl_setopt_array($chk, [
+    try {
+        // ── Step 1: GET login page to obtain CSRF token and session cookie ──
+        $ch = curl_init($baseUrl . '/auth/login');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_COOKIEJAR      => $cookieFile,
+            CURLOPT_COOKIEFILE     => $cookieFile,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_TIMEOUT        => 15,
+        ]);
+        $loginPage = curl_exec($ch);
+        $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode !== 200 || !$loginPage) {
+            return ['error' => 'Unable to connect to OrangeHRM. Please try again later.'];
+        }
+
+        // Extract CSRF token — OrangeHRM uses Vue prop :token="&quot;...&quot;" (may span multiple lines)
+        if (
+            !preg_match('/:token=["\']&quot;([\s\S]*?)&quot;["\']/', $loginPage, $m)
+            && !preg_match('/name=["\']_token["\'].*?value=["\']([^"\']+)["\']/', $loginPage, $m)
+        ) {
+            return ['error' => 'Unable to retrieve login token from OrangeHRM.'];
+        }
+        $csrfToken = preg_replace('/\s+/', '', $m[1]);
+
+        // ── Step 2: POST credentials to /auth/validate ──
+        $ch = curl_init($baseUrl . '/auth/validate');
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => http_build_query([
+                'username' => $username,
+                'password' => $password,
+                '_token'   => $csrfToken,
+            ]),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_COOKIEJAR      => $cookieFile,
+            CURLOPT_COOKIEFILE     => $cookieFile,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HEADER         => true,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
+            CURLOPT_TIMEOUT        => 15,
+        ]);
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        // OrangeHRM redirects to /dashboard on success, back to /auth/login on failure
+        if ($httpCode !== 302) {
+            return ['error' => 'Invalid username or password.'];
+        }
+
+        // Check redirect location — login failure redirects back to /auth/login
+        if (preg_match('/^Location:\s*(.+)$/mi', $response, $locMatch)) {
+            $redirectTo = trim($locMatch[1]);
+            if (strpos($redirectTo, '/auth/login') !== false) {
+                return ['error' => 'Invalid username or password.'];
+            }
+        }
+
+        // ── Step 3: GET /oauth2/authorize (with authenticated session) ──
+        $authorizeParams = http_build_query([
+            'client_id'     => $clientId,
+            'redirect_uri'  => $redirectUri,
+            'response_type' => 'code',
+            'state'         => bin2hex(random_bytes(16)),
+        ]);
+        $authorizeUrl = $webUrl . '/oauth2/authorize?' . $authorizeParams;
+
+        $ch = curl_init($authorizeUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_COOKIEJAR      => $cookieFile,
+            CURLOPT_COOKIEFILE     => $cookieFile,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HEADER         => true,
+            CURLOPT_TIMEOUT        => 15,
+        ]);
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        // ── Step 4: Approve the consent (auto-approve) ──
+        $consentUrl = $webUrl . '/oauth2/authorize/consent?' . $authorizeParams . '&authorized=true';
+
+        $ch = curl_init($consentUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_COOKIEJAR      => $cookieFile,
+            CURLOPT_COOKIEFILE     => $cookieFile,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HEADER         => true,
+            CURLOPT_TIMEOUT        => 15,
+        ]);
+        $response   = curl_exec($ch);
+        $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $redirectUrl = '';
+        if (preg_match('/^Location:\s*(.+)$/mi', $response, $locMatch)) {
+            $redirectUrl = trim($locMatch[1]);
+        }
+        curl_close($ch);
+
+        if ($httpCode !== 302 || !$redirectUrl) {
+            return ['error' => 'OAuth authorization failed. Please try again.'];
+        }
+
+        // Extract authorization code from redirect URL
+        $parsedUrl = parse_url($redirectUrl);
+        parse_str($parsedUrl['query'] ?? '', $queryParams);
+
+        if (empty($queryParams['code'])) {
+            $errMsg = $queryParams['error_description'] ?? ($queryParams['error'] ?? 'Authorization denied.');
+            return ['error' => $errMsg];
+        }
+
+        // ── Step 5: Exchange authorization code for access token ──
+        $ch = curl_init($webUrl . '/oauth2/token');
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => http_build_query([
+                'grant_type'    => 'authorization_code',
+                'code'          => $queryParams['code'],
+                'client_id'     => $clientId,
+                'client_secret' => $clientSecret,
+                'redirect_uri'  => $redirectUri,
+            ]),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
+            CURLOPT_TIMEOUT        => 15,
+        ]);
+        $tokenResponse = curl_exec($ch);
+        $httpCode      = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode !== 200) {
+            return ['error' => 'Failed to obtain access token. Please try again.'];
+        }
+
+        $tokenData = json_decode($tokenResponse, true);
+        if (empty($tokenData['access_token'])) {
+            return ['error' => 'Invalid token response from OrangeHRM.'];
+        }
+
+        // ── Step 6: Verify Admin role ──
+        $ch = curl_init($baseUrl . '/api/v2/admin/users?limit=1');
+        curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HTTPHEADER     => [
                 'Authorization: Bearer ' . $tokenData['access_token'],
@@ -61,27 +192,50 @@ if (isset($_GET['code'])) {
             ],
             CURLOPT_TIMEOUT => 15,
         ]);
-        $chkResponse = curl_exec($chk);
-        $chkHttpCode = curl_getinfo($chk, CURLINFO_HTTP_CODE);
-        curl_close($chk);
+        curl_exec($ch);
+        $adminCheck = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
 
-        if ($chkHttpCode === 403 || $chkHttpCode === 401) {
-            // Not an admin — clear session and redirect with error
-            session_destroy();
-            header('Location: ' . $redirectUri . '?error=not_authorized');
+        if ($adminCheck === 403 || $adminCheck === 401) {
+            return ['error' => 'Access Denied. Only users with the Admin role can access SOHRM.'];
+        }
+
+        return [
+            'access_token'  => $tokenData['access_token'],
+            'refresh_token' => $tokenData['refresh_token'] ?? '',
+            'expires_in'    => $tokenData['expires_in'] ?? 1800,
+        ];
+    } finally {
+        // Always clean up the temp cookie file
+        if (file_exists($cookieFile)) {
+            unlink($cookieFile);
+        }
+    }
+}
+
+// Handle login form submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['sohrm_login'])) {
+    $username = trim($_POST['username'] ?? '');
+    $password = $_POST['password'] ?? '';
+
+    if ($username === '' || $password === '') {
+        $loginError = 'Please enter both username and password.';
+    } else {
+        $result = serverSideOAuth2Login($username, $password, $orhrmBaseUrl, $orhrmWebUrl, $clientId, $clientSecret, $redirectUri);
+
+        if (isset($result['error'])) {
+            $loginError = $result['error'];
+        } else {
+            $_SESSION['access_token']  = $result['access_token'];
+            $_SESSION['refresh_token'] = $result['refresh_token'];
+            $_SESSION['token_expiry']  = time() + $result['expires_in'];
+            header('Location: ' . $redirectUri);
             exit;
         }
     }
-
-    // Redirect to remove code from URL, preserve report params
-    $params = $_GET;
-    unset($params['code'], $params['state']);
-    $qs = http_build_query($params);
-    header('Location: ' . $redirectUri . ($qs ? '?' . $qs : ''));
-    exit;
 }
 
-// Step 2: Refresh token if expired
+// Handle token refresh
 if (isset($_SESSION['access_token'], $_SESSION['token_expiry']) && time() >= $_SESSION['token_expiry'] && !empty($_SESSION['refresh_token'])) {
     $tokenUrl = $orhrmWebUrl . '/oauth2/token';
     $postData = [
@@ -113,11 +267,10 @@ if (isset($_SESSION['access_token'], $_SESSION['token_expiry']) && time() >= $_S
     }
 }
 
-// Step 3: Handle logout
+// Handle logout
 if (isset($_GET['logout'])) {
     session_destroy();
-    // Redirect to OrangeHRM logout to fully destroy the OrangeHRM session too
-    header('Location: ' . $orhrmBaseUrl . '/auth/logout');
+    header('Location: ' . $redirectUri);
     exit;
 }
 
@@ -300,14 +453,6 @@ if ($isAuthenticated) {
     }
 }
 
-// Build OAuth2 login URL
-$loginUrl = $orhrmWebUrl . '/oauth2/authorize?'
-    . http_build_query([
-        'client_id'     => $clientId,
-        'redirect_uri'  => $redirectUri,
-        'response_type' => 'code',
-        'state'         => bin2hex(random_bytes(16)),
-    ]);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -550,18 +695,31 @@ $loginUrl = $orhrmWebUrl . '/oauth2/authorize?'
         <?php if (!$isAuthenticated): ?>
             <!-- ───────── Login Screen ───────── -->
             <h1>Employee Attendance Report <span class="badge-api">via API</span></h1>
-            <p class="subtitle">Uses OrangeHRM Daily 9Hr Compliance API with OAuth2 authentication</p>
+            <p class="subtitle">Sign in with your OrangeHRM Admin credentials</p>
 
-            <?php if (isset($_GET['error']) && $_GET['error'] === 'not_authorized'): ?>
-                <div class="error-box" style="margin-bottom:20px; text-align:center;">
-                    <strong>Access Denied:</strong> You are not authorised to login to SOHRM. Only users with the <strong>Admin</strong> role can access this application.
+            <?php if ($loginError): ?>
+                <div class="error-box" style="text-align:center;">
+                    <?= htmlspecialchars($loginError) ?>
                 </div>
             <?php endif; ?>
 
             <div class="auth-box">
-                <p>You need to sign in with your <strong>OrangeHRM Admin</strong> account to access this report.</p>
-                <p style="font-size:13px; color:#999;">Only users with the Admin role can view attendance data.</p>
-                <a href="<?= htmlspecialchars($loginUrl) ?>" class="btn-login">Sign in with OrangeHRM</a>
+                <p>Sign in with your <strong>OrangeHRM Admin</strong> account to access attendance reports.</p>
+                <form method="POST" action="" style="display:inline-block; text-align:left; width:100%; max-width:320px; margin-top:10px;">
+                    <div style="margin-bottom:14px;">
+                        <label for="username" style="display:block; font-size:13px; font-weight:600; color:#555; margin-bottom:5px;">Username</label>
+                        <input type="text" id="username" name="username" required autofocus
+                            value="<?= htmlspecialchars($_POST['username'] ?? '') ?>"
+                            style="width:100%; padding:10px 12px; border:1px solid #ccc; border-radius:4px; font-size:14px;">
+                    </div>
+                    <div style="margin-bottom:18px;">
+                        <label for="password" style="display:block; font-size:13px; font-weight:600; color:#555; margin-bottom:5px;">Password</label>
+                        <input type="password" id="password" name="password" required
+                            style="width:100%; padding:10px 12px; border:1px solid #ccc; border-radius:4px; font-size:14px;">
+                    </div>
+                    <button type="submit" name="sohrm_login" value="1" class="btn-login" style="width:100%; border:none; cursor:pointer; text-align:center;">Sign In</button>
+                </form>
+                <p style="font-size:12px; color:#999; margin-top:15px;">Only Admin users can access this application.</p>
             </div>
 
         <?php else: ?>
