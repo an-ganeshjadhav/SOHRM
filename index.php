@@ -41,21 +41,25 @@ $loginError = '';
  */
 function serverSideOAuth2Login(string $username, string $password, string $baseUrl, string $webUrl, string $clientId, string $clientSecret, string $redirectUri): array
 {
-    $cookieFile = tempnam(sys_get_temp_dir(), 'sohrm_');
+    // Use a single cURL handle to keep cookies in memory across all steps
+    // (avoids PHP 8.x bug where curl_close doesn't flush session cookies to jar file)
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_COOKIEFILE     => '', // enable in-memory cookie engine
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_TIMEOUT        => 15,
+    ]);
 
     try {
         // ── Step 1: GET login page to obtain CSRF token and session cookie ──
-        $ch = curl_init($baseUrl . '/auth/login');
         curl_setopt_array($ch, [
+            CURLOPT_URL            => $baseUrl . '/auth/login',
+            CURLOPT_HTTPGET        => true,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_COOKIEJAR      => $cookieFile,
-            CURLOPT_COOKIEFILE     => $cookieFile,
-            CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_TIMEOUT        => 15,
+            CURLOPT_HEADER         => false,
         ]);
         $loginPage = curl_exec($ch);
         $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         if ($httpCode !== 200 || !$loginPage) {
             return ['error' => 'Unable to connect to OrangeHRM. Please try again later.'];
@@ -71,8 +75,8 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
         $csrfToken = preg_replace('/\s+/', '', $m[1]);
 
         // ── Step 2: POST credentials to /auth/validate ──
-        $ch = curl_init($baseUrl . '/auth/validate');
         curl_setopt_array($ch, [
+            CURLOPT_URL            => $baseUrl . '/auth/validate',
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => http_build_query([
                 'username' => $username,
@@ -80,16 +84,11 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
                 '_token'   => $csrfToken,
             ]),
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_COOKIEJAR      => $cookieFile,
-            CURLOPT_COOKIEFILE     => $cookieFile,
-            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_HEADER         => true,
             CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
-            CURLOPT_TIMEOUT        => 15,
         ]);
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         // OrangeHRM redirects to /dashboard on success, back to /auth/login on failure
         if ($httpCode !== 302) {
@@ -102,6 +101,13 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
             if (strpos($redirectTo, '/auth/login') !== false) {
                 return ['error' => 'Invalid username or password.'];
             }
+            // Handle password enforcement redirect (new users with weak passwords)
+            if (
+                strpos($redirectTo, 'changeWeakPassword') !== false
+                || strpos($redirectTo, 'resetWeakPassword') !== false
+            ) {
+                return ['error' => 'Your password does not meet the strength requirements. Please change your password in OrangeHRM first, then try again.'];
+            }
         }
 
         // ── Step 3: GET /oauth2/authorize (with authenticated session) ──
@@ -113,30 +119,23 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
         ]);
         $authorizeUrl = $webUrl . '/oauth2/authorize?' . $authorizeParams;
 
-        $ch = curl_init($authorizeUrl);
         curl_setopt_array($ch, [
+            CURLOPT_URL            => $authorizeUrl,
+            CURLOPT_HTTPGET        => true,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_COOKIEJAR      => $cookieFile,
-            CURLOPT_COOKIEFILE     => $cookieFile,
-            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_HEADER         => true,
-            CURLOPT_TIMEOUT        => 15,
         ]);
         $response = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         // ── Step 4: Approve the consent (auto-approve) ──
         $consentUrl = $webUrl . '/oauth2/authorize/consent?' . $authorizeParams . '&authorized=true';
 
-        $ch = curl_init($consentUrl);
         curl_setopt_array($ch, [
+            CURLOPT_URL            => $consentUrl,
+            CURLOPT_HTTPGET        => true,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_COOKIEJAR      => $cookieFile,
-            CURLOPT_COOKIEFILE     => $cookieFile,
-            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_HEADER         => true,
-            CURLOPT_TIMEOUT        => 15,
         ]);
         $response   = curl_exec($ch);
         $httpCode   = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -144,7 +143,6 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
         if (preg_match('/^Location:\s*(.+)$/mi', $response, $locMatch)) {
             $redirectUrl = trim($locMatch[1]);
         }
-        curl_close($ch);
 
         if ($httpCode !== 302 || !$redirectUrl) {
             return ['error' => 'OAuth authorization failed. Please try again.'];
@@ -160,8 +158,8 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
         }
 
         // ── Step 5: Exchange authorization code for access token ──
-        $ch = curl_init($webUrl . '/oauth2/token');
         curl_setopt_array($ch, [
+            CURLOPT_URL            => $webUrl . '/oauth2/token',
             CURLOPT_POST           => true,
             CURLOPT_POSTFIELDS     => http_build_query([
                 'grant_type'    => 'authorization_code',
@@ -171,12 +169,11 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
                 'redirect_uri'  => $redirectUri,
             ]),
             CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HEADER         => false,
             CURLOPT_HTTPHEADER     => ['Content-Type: application/x-www-form-urlencoded'],
-            CURLOPT_TIMEOUT        => 15,
         ]);
         $tokenResponse = curl_exec($ch);
         $httpCode      = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         if ($httpCode !== 200) {
             return ['error' => 'Failed to obtain access token. Please try again.'];
@@ -188,18 +185,18 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
         }
 
         // ── Step 6: Verify Admin role ──
-        $ch = curl_init($baseUrl . '/api/v2/admin/users?limit=1');
         curl_setopt_array($ch, [
+            CURLOPT_URL            => $baseUrl . '/api/v2/admin/users?limit=1',
+            CURLOPT_HTTPGET        => true,
             CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HEADER         => false,
             CURLOPT_HTTPHEADER     => [
                 'Authorization: Bearer ' . $tokenData['access_token'],
                 'Accept: application/json',
             ],
-            CURLOPT_TIMEOUT => 15,
         ]);
         curl_exec($ch);
         $adminCheck = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
 
         if ($adminCheck === 403 || $adminCheck === 401) {
             return ['error' => 'Access Denied. Only users with the Admin role can access SOHRM.'];
@@ -211,10 +208,7 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
             'expires_in'    => $tokenData['expires_in'] ?? 1800,
         ];
     } finally {
-        // Always clean up the temp cookie file
-        if (file_exists($cookieFile)) {
-            unlink($cookieFile);
-        }
+        curl_close($ch);
     }
 }
 
