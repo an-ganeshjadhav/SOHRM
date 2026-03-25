@@ -13,6 +13,11 @@
 
 session_start();
 
+// Prevent browser from caching authenticated pages (fixes back-button form resubmission)
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: Thu, 01 Jan 1970 00:00:00 GMT');
+
 // ───────────────────────────── Config ─────────────────────────────
 require_once __DIR__ . '/config.php';
 
@@ -213,26 +218,32 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
     }
 }
 
-// Handle login form submission
+// Handle login form submission (PRG pattern — always redirect after POST)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['sohrm_login'])) {
     $username = trim($_POST['username'] ?? '');
     $password = $_POST['password'] ?? '';
 
     if ($username === '' || $password === '') {
-        $loginError = 'Please enter both username and password.';
+        $_SESSION['login_error'] = 'Please enter both username and password.';
     } else {
         $result = serverSideOAuth2Login($username, $password, $orhrmBaseUrl, $orhrmWebUrl, $clientId, $clientSecret, $redirectUri);
 
         if (isset($result['error'])) {
-            $loginError = $result['error'];
+            $_SESSION['login_error'] = $result['error'];
         } else {
             $_SESSION['access_token']  = $result['access_token'];
             $_SESSION['refresh_token'] = $result['refresh_token'];
             $_SESSION['token_expiry']  = time() + $result['expires_in'];
-            header('Location: ' . $redirectUri);
-            exit;
         }
     }
+    header('Location: ' . $redirectUri);
+    exit;
+}
+
+// Retrieve and clear any login error from session (flash message)
+if (!empty($_SESSION['login_error'])) {
+    $loginError = $_SESSION['login_error'];
+    unset($_SESSION['login_error']);
 }
 
 // Handle token refresh
@@ -267,8 +278,13 @@ if (isset($_SESSION['access_token'], $_SESSION['token_expiry']) && time() >= $_S
     }
 }
 
-// Handle logout
+// Handle logout — fully destroy session
 if (isset($_GET['logout'])) {
+    $_SESSION = [];
+    if (ini_get('session.use_cookies')) {
+        $p = session_get_cookie_params();
+        setcookie(session_name(), '', time() - 42000, $p['path'], $p['domain'], $p['secure'], $p['httponly']);
+    }
     session_destroy();
     header('Location: ' . $redirectUri);
     exit;
