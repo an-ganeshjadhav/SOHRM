@@ -185,18 +185,21 @@ function serverSideOAuth2Login(string $username, string $password, string $baseU
         }
 
         // ── Step 6: Verify Admin role ──
-        curl_setopt_array($ch, [
-            CURLOPT_URL            => $baseUrl . '/api/v2/admin/users?limit=1',
+        // Use a fresh cURL handle (no session cookies) to verify the Bearer token works independently
+        $adminCh = curl_init($baseUrl . '/api/v2/admin/users?limit=1');
+        curl_setopt_array($adminCh, [
             CURLOPT_HTTPGET        => true,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_HEADER         => false,
+            CURLOPT_TIMEOUT        => 15,
             CURLOPT_HTTPHEADER     => [
                 'Authorization: Bearer ' . $tokenData['access_token'],
                 'Accept: application/json',
             ],
         ]);
-        curl_exec($ch);
-        $adminCheck = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_exec($adminCh);
+        $adminCheck = curl_getinfo($adminCh, CURLINFO_HTTP_CODE);
+        curl_close($adminCh);
 
         if ($adminCheck === 403 || $adminCheck === 401) {
             return ['error' => 'Access Denied. Only users with the Admin role can access SOHRM.'];
@@ -230,7 +233,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['sohrm_login'])) {
             $_SESSION['token_expiry']  = time() + $result['expires_in'];
         }
     }
-    header('Location: ' . $redirectUri);
+    header('Location: ' . $_SERVER['SCRIPT_NAME']);
     exit;
 }
 
@@ -280,7 +283,7 @@ if (isset($_GET['logout'])) {
         setcookie(session_name(), '', time() - 42000, $p['path'], $p['domain'], $p['secure'], $p['httponly']);
     }
     session_destroy();
-    header('Location: ' . $redirectUri);
+    header('Location: ' . $_SERVER['SCRIPT_NAME']);
     exit;
 }
 
